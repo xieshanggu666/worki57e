@@ -1,0 +1,13 @@
+{
+  "name": "bunker-survival",
+  "version": "1.0.0",
+  "private": true,
+  "description": "末日地堡生存：FastAPI + SQLite 后端、Vue 3 前端（同端口托管）的模拟经营游戏",
+  "scripts": {
+    "setup": "node scripts/manage.js setup",
+    "start": "node scripts/manage.js start",
+    "dev": "node scripts/manage.js dev",
+    "init-db": "node scripts/manage.js init-db",
+    "test": "node scripts/manage.js test"
+  }
+}
