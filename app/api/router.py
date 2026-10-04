@@ -96,9 +96,7 @@ def create_session(body: SessionCreate, db: Session = Depends(get_db)):
 
 @router.get("/sessions/{sid}", response_model=SessionDetail)
 def get_session(sid: int, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     return get_session_detail(gs, db)
 
 
@@ -193,6 +191,13 @@ def get_session_detail(gs, db):
 
 
 # ---- 游戏动作 ----
+def _get_session_or_404(db, sid):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    return gs
+
+
 def _run_mutation(db, gs, action):
     """统一执行经营类状态变更。
 
@@ -217,14 +222,41 @@ def _run_mutation(db, gs, action):
         raise HTTPException(409, "档案已被其他请求更新，请刷新后重试")
 
 
-@router.post("/sessions/{sid}/advance", response_model=AdvanceResult)
-def advance(sid: int, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+def _run_decision(db, gs, resolve, reconcile):
+    """统一执行待决事件结算（危机/探索遭遇/途中事件/返程/撤单）。
+
+    三类待决事件共用同一套并发语义：
+    - 业务校验失败 → 400；凭据过期/串档 → 409
+    - 乐观锁版本冲突（并发请求已先行落库）→ 凭档案级幂等凭据核对：
+      同一次抉择则安全回放（效果只结算一次，落败方也拿到 200），
+      对不上任何已知结算则 409 拒绝，杜绝并发重复结算
+    """
     eng = BunkerEngine(db, gs)
     try:
-        crisis = eng.advance_day()
+        resolve(eng)
+        db.commit()
+        db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        db.rollback()
+        db.refresh(gs)
+        try:
+            reconcile(BunkerEngine(db, gs))
+        except BunkerEngineConflict as e:
+            raise HTTPException(409, str(e))
+
+
+@router.post("/sessions/{sid}/advance", response_model=AdvanceResult)
+def advance(sid: int, db: Session = Depends(get_db)):
+    gs = _get_session_or_404(db, sid)
+    eng = BunkerEngine(db, gs)
+    try:
+        eng.advance_day()
         db.commit()
         db.refresh(gs)
     except BunkerEngineError as e:
@@ -232,121 +264,60 @@ def advance(sid: int, db: Session = Depends(get_db)):
         raise HTTPException(400, str(e))
     except StaleDataError:
         # 并发/重复的“推进一天”落败：另一个请求已经推进过，这里幂等回放
-        # 当前状态（含可能已挂起的待处理危机/探索遭遇），绝不再多推进一天
+        # 当前状态（含可能已挂起的待决事件），绝不再多推进一天
         db.rollback()
         db.refresh(gs)
-        crisis = gs.pending_crisis
-    # 探索队在外时推进可能挂起的是遭遇而非地堡危机：把当前任一待处理抉择带回，
-    # 前端据此恢复对应弹层（落败回放与正常返回保持同一口径）
-    if crisis is None and gs.expedition and gs.expedition.get("pending_encounter"):
-        crisis = gs.expedition["pending_encounter"]
-    # 贸易押运队在途时推进也可能挂起途中事件，统一走 pending_event 返回
-    if crisis is None and gs.trade_order and gs.trade_order.get("pending_incident"):
-        crisis = gs.trade_order["pending_incident"]
+    # 推进可能挂起任一待决事件（地堡危机/探索遭遇/押运途中事件）：统一从
+    # 档案快照检出带回，前端据此恢复对应弹层（落败回放与正常返回同一口径）
+    _, pending = BunkerEngine(db, gs).current_pending_event()
     # pending_event 为语义准确的新字段；crisis 为兼容旧前端的同值别名
-    return AdvanceResult(session=get_session_detail(gs, db), pending_event=crisis, crisis=crisis)
+    return AdvanceResult(session=get_session_detail(gs, db), pending_event=pending, crisis=pending)
 
 
 @router.post("/sessions/{sid}/resolve", response_model=SessionDetail)
 def resolve_crisis(sid: int, body: CrisisChoice, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.resolve_crisis(
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.resolve_crisis(
             body.event_key, body.choice_key, body.target_id, token=body.token
-        )
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发的重复结算：版本不匹配说明对方已先落库。核对是否同一次抉择：
-        # 相同则幂等回放当前状态（效果只结算一次），否则 409 拒绝
-        db.rollback()
-        db.refresh(gs)
-        replay_eng = BunkerEngine(db, gs)
-        try:
-            replay_eng.reconcile_stale_resolution(
-                body.event_key, body.choice_key, body.target_id, token=body.token
-            )
-        except BunkerEngineConflict as e:
-            raise HTTPException(409, str(e))
+        ),
+        lambda eng: eng.reconcile_stale_resolution(
+            body.event_key, body.choice_key, body.target_id, token=body.token
+        ),
+    )
     return get_session_detail(gs, db)
 
 
 # ---- 探索队 ----
 @router.post("/sessions/{sid}/expedition/send", response_model=SessionDetail)
 def send_expedition(sid: int, body: ExpeditionSend, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     _run_mutation(db, gs, lambda eng: eng.send_expedition(body.member_ids, body.supplies))
     return get_session_detail(gs, db)
 
 
 @router.post("/sessions/{sid}/expedition/resolve", response_model=SessionDetail)
 def resolve_expedition(sid: int, body: ExpeditionEncounterChoice, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.resolve_expedition_encounter(body.choice_key, token=body.token)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发的重复结算：版本不匹配说明对方已先落库。核对是否同一次遭遇抉择：
-        # 相同则幂等回放当前状态（效果只结算一次），否则 409 拒绝
-        db.rollback()
-        db.refresh(gs)
-        replay_eng = BunkerEngine(db, gs)
-        try:
-            replay_eng.reconcile_stale_expedition(
-                "encounter", token=body.token, choice_key=body.choice_key
-            )
-        except BunkerEngineConflict as e:
-            raise HTTPException(409, str(e))
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.resolve_expedition_encounter(body.choice_key, token=body.token),
+        lambda eng: eng.reconcile_stale_expedition(
+            "encounter", token=body.token, choice_key=body.choice_key
+        ),
+    )
     return get_session_detail(gs, db)
 
 
 @router.post("/sessions/{sid}/expedition/return", response_model=SessionDetail)
 def return_expedition(sid: int, body: ExpeditionReturn, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.return_expedition(token=body.token)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发的重复返程：版本不匹配说明对方已先落库。核对是否同一支队伍：
-        # 相同则幂等回放（战利品只结算一次，队伍已清除也能识别），否则 409
-        db.rollback()
-        db.refresh(gs)
-        replay_eng = BunkerEngine(db, gs)
-        try:
-            replay_eng.reconcile_stale_expedition("return", exp_token=body.token)
-        except BunkerEngineConflict as e:
-            raise HTTPException(409, str(e))
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.return_expedition(token=body.token),
+        lambda eng: eng.reconcile_stale_expedition("return", exp_token=body.token),
+    )
     return get_session_detail(gs, db)
 
 
@@ -354,9 +325,7 @@ def return_expedition(sid: int, body: ExpeditionReturn, db: Session = Depends(ge
 @router.get("/sessions/{sid}/trade/market")
 def trade_market(sid: int, db: Session = Depends(get_db)):
     """当日外部聚落的贸易/救援报价（按天确定性轮换，只读）。"""
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     eng = BunkerEngine(db, gs)
     return {
         "day": gs.day,
@@ -367,9 +336,7 @@ def trade_market(sid: int, db: Session = Depends(get_db)):
 
 @router.post("/sessions/{sid}/trade/apply", response_model=SessionDetail)
 def trade_apply(sid: int, body: TradeApply, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     _run_mutation(
         db, gs, lambda eng: eng.apply_trade(body.offer_id, body.escort_ids)
     )
@@ -378,68 +345,31 @@ def trade_apply(sid: int, body: TradeApply, db: Session = Depends(get_db)):
 
 @router.post("/sessions/{sid}/trade/resolve", response_model=SessionDetail)
 def trade_resolve(sid: int, body: TradeIncidentChoice, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.resolve_trade_incident(body.choice_key, token=body.token)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发的重复结算：版本不匹配说明对方已先落库。核对是否同一次途中事件抉择：
-        # 相同（含抉择直接触发失败回退的情形）则幂等回放，否则 409 拒绝
-        db.rollback()
-        db.refresh(gs)
-        replay_eng = BunkerEngine(db, gs)
-        try:
-            replay_eng.reconcile_stale_trade(
-                "incident", token=body.token, choice_key=body.choice_key
-            )
-        except BunkerEngineConflict as e:
-            raise HTTPException(409, str(e))
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.resolve_trade_incident(body.choice_key, token=body.token),
+        lambda eng: eng.reconcile_stale_trade(
+            "incident", token=body.token, choice_key=body.choice_key
+        ),
+    )
     return get_session_detail(gs, db)
 
 
 @router.post("/sessions/{sid}/trade/cancel", response_model=SessionDetail)
 def trade_cancel(sid: int, body: TradeCancel, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
-    eng = BunkerEngine(db, gs)
-    try:
-        eng.cancel_trade(token=body.token)
-        db.commit()
-        db.refresh(gs)
-    except BunkerEngineConflict as e:
-        db.rollback()
-        raise HTTPException(409, str(e))
-    except BunkerEngineError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except StaleDataError:
-        # 并发撤单落败：同一订单的撤单已落库时幂等回放，托管只退一次
-        db.rollback()
-        db.refresh(gs)
-        replay_eng = BunkerEngine(db, gs)
-        try:
-            replay_eng.reconcile_stale_trade("cancel", token=body.token)
-        except BunkerEngineConflict as e:
-            raise HTTPException(409, str(e))
+    gs = _get_session_or_404(db, sid)
+    _run_decision(
+        db, gs,
+        lambda eng: eng.cancel_trade(token=body.token),
+        lambda eng: eng.reconcile_stale_trade("cancel", token=body.token),
+    )
     return get_session_detail(gs, db)
 
 
 @router.post("/sessions/{sid}/build", response_model=SessionDetail)
 def build(sid: int, body: BuildRequest, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     if body.category not in FACILITY_OUTPUT:
         raise HTTPException(400, "未知设施类别")
     _run_mutation(db, gs, lambda eng: eng.build_facility(body.category))
@@ -448,18 +378,14 @@ def build(sid: int, body: BuildRequest, db: Session = Depends(get_db)):
 
 @router.post("/sessions/{sid}/upgrade/{fid}", response_model=SessionDetail)
 def upgrade(sid: int, fid: int, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     _run_mutation(db, gs, lambda eng: eng.upgrade_facility(fid))
     return get_session_detail(gs, db)
 
 
 @router.post("/sessions/{sid}/resident/{rid}/job", response_model=SessionDetail)
 def set_job(sid: int, rid: int, body: JobAssign, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     _run_mutation(db, gs, lambda eng: eng.set_job(rid, body.job))
     return get_session_detail(gs, db)
 
@@ -468,9 +394,7 @@ def set_job(sid: int, rid: int, body: JobAssign, db: Session = Depends(get_db)):
 @router.post("/sessions/{sid}/medical/register/{rid}", response_model=SessionDetail)
 def register_case(sid: int, rid: int, body: MedicalRegister, db: Session = Depends(get_db)):
     """为居民登记病例（健康低于登记线且已建救治中心）。"""
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     _run_mutation(
         db, gs,
         lambda eng: eng.register_case(rid, infectious=body.infectious),
@@ -481,18 +405,14 @@ def register_case(sid: int, rid: int, body: MedicalRegister, db: Session = Depen
 @router.post("/sessions/{sid}/medical/admit/{rid}", response_model=SessionDetail)
 def admit_case(sid: int, rid: int, body: MedicalAdmit, db: Session = Depends(get_db)):
     """收治已登记病例：转入治疗或隔离床位（已在治者可切换方案）。"""
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     _run_mutation(db, gs, lambda eng: eng.admit_case(rid, body.mode))
     return get_session_detail(gs, db)
 
 
 @router.delete("/sessions/{sid}", response_model=Message)
 def delete_session(sid: int, db: Session = Depends(get_db)):
-    gs = db.get(GameSession, sid)
-    if not gs:
-        raise HTTPException(404, "档案不存在")
+    gs = _get_session_or_404(db, sid)
     db.delete(gs)
     db.commit()
     return Message(detail="已删除")

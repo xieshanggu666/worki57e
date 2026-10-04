@@ -9,7 +9,9 @@
 - row_version：乐观锁版本号，旧行统一从 1 开始
 
 补列后再做一次“旧存档归一化”（reconcile_old_saves），保证历史行加载进新引擎后
-状态机可以唯一收敛：
+状态机可以唯一收敛。三类待决事件（危机/探索遭遇/押运途中事件）在引擎侧共用
+同一套"待决事件管线"（见 services/engine.py 的 _PENDING_SLOTS），这里的归一化
+也走同一份快照校验（_clean_pending_snapshot）：
 - 已结束档案上悬而未决的危机/探索队/贸易订单一律清除，统一收敛到 ended
 - 损坏/悬空的快照（成员全部不在档、目标居民失踪、JSON 残缺）不阻塞每日推进
 - 病例簿中结构残缺或居民已不在档的活跃病例收敛/剔除，终态履历同步校正
@@ -163,6 +165,35 @@ def _resident_ids(conn, sid):
     }
 
 
+def _prune_member_ids(raw_members, known):
+    """剔除悬空/重复编号，保持首次出现顺序。返回 (有效编号列表, 是否发生变化)。"""
+    members, seen = [], set()
+    for m in raw_members:
+        if m in known and m not in seen:
+            seen.add(m)
+            members.append(m)
+    return members, members != raw_members
+
+
+def _clean_pending_snapshot(pending, valid_target_ids):
+    """待决事件快照归一化：危机/探索遭遇/押运途中事件共用同一快照结构。
+
+    - 非 dict（结构损坏）：丢弃
+    - 绑定目标已不在有效集合（居民表/队伍编制）：丢弃——无法再结算单体效果
+
+    返回 (归一化快照, 是否发生变化)。调用方决定丢弃快照后是清空整个字段
+    （危机）还是仅摘除快照、保留宿主（探索队/贸易订单）。
+    """
+    if pending is None:
+        return None, False
+    if not isinstance(pending, dict):
+        return None, True
+    target_id = pending.get("target_id")
+    if target_id is not None and target_id not in valid_target_ids:
+        return None, True
+    return pending, False
+
+
 def _clean_pending_crisis(conn, sid, crisis):
     """待处理危机快照结构残缺或绑定目标已不在档：清空以解除每日阶段的死锁。
 
@@ -174,10 +205,7 @@ def _clean_pending_crisis(conn, sid, crisis):
         return None, True
     if not crisis.get("event") or not isinstance(crisis.get("choices"), list):
         return None, True
-    target_id = crisis.get("target_id")
-    if target_id is not None and target_id not in _resident_ids(conn, sid):
-        return None, True
-    return crisis, False
+    return _clean_pending_snapshot(crisis, _resident_ids(conn, sid))
 
 
 def _clean_expedition(exp, conn, sid):
@@ -193,30 +221,17 @@ def _clean_expedition(exp, conn, sid):
     raw_members = exp.get("members")
     if not isinstance(raw_members, list):
         return None, True
-    known = _resident_ids(conn, sid)
-    # 剔除悬空/重复编号，保持首次出现顺序
-    members, seen = [], set()
-    for m in raw_members:
-        if m in known and m not in seen:
-            seen.add(m)
-            members.append(m)
+    members, changed = _prune_member_ids(raw_members, _resident_ids(conn, sid))
     if not members:
         return None, True
-    changed = members != raw_members
     cleaned = dict(exp)
     cleaned["members"] = members
     # 待处理遭遇绑定的目标若已不在队中，丢弃该遭遇（无法再结算单体效果）
-    pending = cleaned.get("pending_encounter")
-    if not isinstance(pending, dict):
-        if pending is not None:
-            changed = True
-        cleaned["pending_encounter"] = None
-    else:
-        target_id = pending.get("target_id")
-        if target_id is not None and target_id not in members:
-            cleaned["pending_encounter"] = None
-            changed = True
-    return cleaned, changed
+    pending, pending_changed = _clean_pending_snapshot(
+        cleaned.get("pending_encounter"), members
+    )
+    cleaned["pending_encounter"] = pending
+    return cleaned, changed or pending_changed
 
 
 # 贸易订单合法状态链
@@ -247,28 +262,16 @@ def _clean_trade_order(order, conn, sid):
     raw_escorts = order.get("escorts")
     if not isinstance(raw_escorts, list) or not order.get("token"):
         return None, True
-    known = _resident_ids(conn, sid)
-    escorts, seen = [], set()
-    for m in raw_escorts:
-        if m in known and m not in seen:
-            seen.add(m)
-            escorts.append(m)
+    escorts, changed = _prune_member_ids(raw_escorts, _resident_ids(conn, sid))
     if not escorts:
         return None, True
-    changed = escorts != raw_escorts
     cleaned = dict(order)
     cleaned["escorts"] = escorts
-    pending = cleaned.get("pending_incident")
-    if not isinstance(pending, dict):
-        if pending is not None:
-            changed = True
-        cleaned["pending_incident"] = None
-    else:
-        target_id = pending.get("target_id")
-        if target_id is not None and target_id not in escorts:
-            cleaned["pending_incident"] = None
-            changed = True
-    return cleaned, changed
+    pending, pending_changed = _clean_pending_snapshot(
+        cleaned.get("pending_incident"), escorts
+    )
+    cleaned["pending_incident"] = pending
+    return cleaned, changed or pending_changed
 
 
 # 病例合法状态：登记/治疗/隔离（活跃）与康复/病亡（终态）

@@ -31,8 +31,10 @@ class GameSession(Base):
     status = Column(String(16), nullable=False, default="running")  # running/over/win
     resources = Column(JSON, nullable=False, default=dict)  # {food,water,power,oxygen}
     survivors = Column(Integer, nullable=False, default=0)
-    # 待处理危机快照（含一次性 token、绑定的事件与目标），落库后刷新可恢复决策；
-    # 为 None 表示当前处于“每日阶段”，不允许凭空结算危机
+    # 待决事件快照列（含一次性 token、绑定的事件与目标），落库后刷新可恢复决策；
+    # 为 None 表示当前处于“每日阶段”，不允许凭空结算危机。
+    # 三类待决事件（危机/探索遭遇/押运途中事件）共用引擎的"待决事件统一管线"
+    # （见 services/engine.py 的 _PENDING_SLOTS）：同构快照、幂等凭据、互斥与终局收敛
     pending_crisis = Column(JSON, nullable=True)
     # 最近一次危机结算的幂等凭据，重复/并发落败请求据此安全回放，不再二次结算
     last_resolution = Column(JSON, nullable=True)

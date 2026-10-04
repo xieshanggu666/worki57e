@@ -115,6 +115,13 @@ PHASE_EXPEDITION = "expedition"
 # 贸易阶段：押运队在途且存在待处理途中事件，状态机拒绝一切经营/推进动作
 PHASE_TRADE = "trade"
 
+# 待决事件种类：地堡危机 / 探索遭遇 / 押运途中事件。
+# 三类挂起抉择共用同一套"统一待决事件管线"（见 _PENDING_SLOTS 与引擎内
+# "待决事件统一管线"一节）：同构快照落库恢复、同机幂等凭据回放、
+# 同一互斥状态机与终局收敛，差异仅在宿主与效果结算。
+PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT = "crisis", "encounter", "incident"
+PENDING_KINDS = (PENDING_CRISIS, PENDING_ENCOUNTER, PENDING_INCIDENT)
+
 
 class BunkerEngine:
     def __init__(self, db: Session, session: GameSession, rand=None):
@@ -127,19 +134,76 @@ class BunkerEngine:
     def phase(self):
         if self.session.status != "running":
             return PHASE_ENDED
-        if self.session.pending_crisis:
-            return PHASE_CRISIS
-        exp = self.session.expedition
-        if exp and exp.get("status") == "away" and exp.get("pending_encounter"):
-            return PHASE_EXPEDITION
-        order = self.session.trade_order
-        if order and order.get("status") == TRADE_TRANSPORTING and order.get("pending_incident"):
-            return PHASE_TRADE
-        return PHASE_DAILY
+        kind, _ = self.current_pending_event()
+        return self._slot(kind)["phase"] if kind else PHASE_DAILY
 
     def _require_phase(self, phase, message):
         if self.phase != phase:
             raise BunkerEngineError(message)
+
+    # ---- 待决事件统一管线 ----
+    # 三类挂起抉择（危机/遭遇/途中事件）共用同一生命周期：
+    #   触发 → 同构快照落库（刷新/重开后恢复同一场抉择）→ 结算 → 写档案级
+    #   幂等凭据（连点/并发落败安全回放）→ 清除快照（互斥：同一时刻至多一个
+    #   待决事件）→ 终局一律清空（收敛到 ended，不留悬而未决的抉择）。
+    # 槽位差异（宿主列/事件池/凭据列/阶段）在模块底部 _PENDING_SLOTS 声明。
+
+    def _slot(self, kind):
+        return _PENDING_SLOTS[kind]
+
+    def _pending_host(self, kind):
+        """待决事件的宿主快照：危机宿主即档案本身（返回 None 表示不嵌套）。"""
+        attr = self._slot(kind)["host_attr"]
+        return getattr(self.session, attr) if attr else None
+
+    def _host_active(self, kind):
+        """宿主是否处于可挂起待决事件的状态（队伍在外/订单在途）。"""
+        slot = self._slot(kind)
+        if slot["host_attr"] is None:
+            return True
+        host = self._pending_host(kind)
+        return bool(host) and host.get("status") == slot["host_status"]
+
+    def _get_pending(self, kind):
+        """读取某类待决事件快照（持久化位置由槽位声明，恢复口径三类一致）。"""
+        slot = self._slot(kind)
+        if slot["host_attr"] is None:
+            return getattr(self.session, slot["field"])
+        host = self._pending_host(kind)
+        return host.get(slot["field"]) if host else None
+
+    def _write_pending(self, kind, value):
+        """写入/清除待决快照；嵌套快照整体回写宿主，确保 JSON 列变更被追踪落库。"""
+        slot = self._slot(kind)
+        if slot["host_attr"] is None:
+            setattr(self.session, slot["field"], value)
+            return
+        host = dict(self._pending_host(kind) or {})
+        host[slot["field"]] = value
+        setattr(self.session, slot["host_attr"], host)
+
+    def current_pending_event(self):
+        """当前挂起的待决事件 (kind, snapshot)；无则 (None, None)。
+
+        事件互斥由状态机保证：同一时刻全档案至多一个待决事件，
+        按危机 → 遭遇 → 途中事件的固定优先级检出。
+        """
+        for kind in PENDING_KINDS:
+            if not self._host_active(kind):
+                continue
+            snap = self._get_pending(kind)
+            if snap:
+                return kind, snap
+        return None, None
+
+    def _clear_all_pending(self):
+        """终局收敛：清除全部待决快照与离堡任务宿主，不留悬而未决的抉择。"""
+        for kind in PENDING_KINDS:
+            slot = self._slot(kind)
+            if slot["host_attr"] is None:
+                self._write_pending(kind, None)
+            else:
+                setattr(self.session, slot["host_attr"], None)
 
     # ---- 资源查询 ----
     def get_resources(self):
@@ -435,15 +499,6 @@ class BunkerEngine:
     def _effect_value(effect):
         return effect["value"] if isinstance(effect, dict) else effect
 
-    def _event_needs_target(self, event):
-        """事件是否存在只作用于单个居民的决策；只有这类事件才随机目标。"""
-        for c in event["choices"]:
-            effects = c.get("effects", {})
-            for stat in ("health", "morale"):
-                if stat in effects and self._effect_scope(effects[stat]) == "single":
-                    return True
-        return False
-
     def _maybe_trigger_crisis(self):
         if self.rand.random() > CRISIS_DAY_CHANCE:
             return None
@@ -451,18 +506,21 @@ class BunkerEngine:
         crisis = self._build_crisis(event)
         # 待处理危机整体写入存档：事件、目标、选项与一次性 token 一起绑定，
         # 刷新页面后凭档案即可恢复同一个决策
-        self.session.pending_crisis = crisis
+        self._write_pending(PENDING_CRISIS, crisis)
         return crisis
 
-    def _build_crisis(self, event):
-        # 仅当事件存在单体效果的决策时才抽取受影响居民；
-        # 全体事件不产生目标，前端也无从回传 target_id。
-        # 目标只从"在堡存活居民"中抽取：探索队外出期间不受地堡危机波及
-        needs_target = self._event_needs_target(event)
-        alive = self._in_bunker_residents()
-        target = self.rand.choice(alive) if needs_target and alive else None
+    def _build_pending_event(self, event, target_pool):
+        """构造待决事件快照：三类抉择（危机/遭遇/途中事件）共用同一结构。
+
+        快照携带一次性 token、事件 key、发生日与绑定目标，随档案整体落库；
+        刷新/重开后凭快照恢复同一场抉择，重复/并发提交凭 token 识别。
+        仅当事件存在单体效果的决策时才从候选池抽取目标（危机=在堡居民，
+        遭遇/途中事件=队内成员），全体事件不产生目标，前端也无从回传。
+        """
+        needs_target = any(self._choice_targeted(c) for c in event["choices"])
+        target = self.rand.choice(target_pool) if needs_target and target_pool else None
         return {
-            "token": uuid.uuid4().hex,  # 本次待处理危机的一次性凭据
+            "token": uuid.uuid4().hex,  # 本次待决事件的一次性凭据
             "event": event["key"],
             "day": self.session.day,
             "title": event["title"],
@@ -481,6 +539,10 @@ class BunkerEngine:
             ],
         }
 
+    def _build_crisis(self, event):
+        # 目标只从"在堡存活居民"中抽取：探索队/押运队外出期间不受地堡危机波及
+        return self._build_pending_event(event, self._in_bunker_residents())
+
     @classmethod
     def _choice_targeted(cls, choice):
         """该决策是否含只作用于目标本人的健康/士气效果。"""
@@ -497,38 +559,199 @@ class BunkerEngine:
             raise BunkerEngineError("游戏已结束，无法执行该操作")
 
     def _require_daily_phase(self, action):
-        """经营/推进类动作只允许在每日阶段执行。"""
+        """经营/推进类动作只允许在每日阶段执行：任一待决事件挂起即锁定。"""
         self._ensure_running()
-        if self.phase == PHASE_CRISIS:
-            raise BunkerEngineError(f"存在待处理危机，必须先完成抉择才能{action}")
-        if self.phase == PHASE_EXPEDITION:
-            raise BunkerEngineError(f"存在待处理探索遭遇，必须先完成抉择才能{action}")
-        if self.phase == PHASE_TRADE:
-            raise BunkerEngineError(f"存在待处理途中事件，必须先完成抉择才能{action}")
+        kind, _ = self.current_pending_event()
+        if kind:
+            raise BunkerEngineError(
+                f"存在待处理{self._slot(kind)['zh']}，必须先完成抉择才能{action}"
+            )
 
-    def _pending_event(self):
-        """取出当前待处理危机对应的事件定义；存档损坏时视为无法结算。"""
-        pending = self.session.pending_crisis
-        if not pending:
-            return None, None
-        event_key = pending.get("event")
-        event = next((e for e in CRISIS_POOL if e["key"] == event_key), None)
+    def _require_no_mission(self, action):
+        """离堡任务互斥：同一时间只允许一支在外探索队/一笔在谈贸易订单。"""
+        if self.session.expedition:
+            raise BunkerEngineError(f"已有探索队在外，无法同时{action}")
+        if self.session.trade_order:
+            raise BunkerEngineError(f"已有在谈/在途贸易订单，无法同时{action}")
+
+    def _pending_event_def(self, kind, pending):
+        """取出待决快照对应的事件定义；存档损坏（事件池中不存在）时视为无法结算。"""
+        event = next(
+            (e for e in self._slot(kind)["pool"] if e["key"] == pending.get("event")),
+            None,
+        )
         if event is None:
-            raise BunkerEngineError("待处理危机已失效，请刷新档案后重试")
-        return pending, event
+            raise BunkerEngineError(
+                f"待处理{self._slot(kind)['zh']}已失效，请刷新档案后重试"
+            )
+        return event
 
     @staticmethod
-    def _matches_resolution(rec, event_key, choice_key, target_id, day=None):
-        """判断落败/重试请求是否就是上一次已完成的那次结算（幂等回放）。
+    def _event_choice(event, choice_key):
+        """在事件定义中定位所选决策；未知选项一律拒绝。"""
+        choice = next((c for c in event["choices"] if c["key"] == choice_key), None)
+        if not choice:
+            raise BunkerEngineError("未知决策选项")
+        return choice
+
+    def _locate_pending_decision(self, kind, token):
+        """定位当前待决事件：结算必须命中档案里唯一的待决快照。
+
+        适用于宿主嵌套类（遭遇/途中事件；危机宿主即档案，走 resolve_crisis
+        自身的定位流程）。返回 (host, pending)。宿主缺失/已前进或快照已被
+        处理时：携带凭据的请求按 409（状态已变化）拒绝，无凭据请求按 400；
+        快照 token 不符（过期/串档）一律 409。不能凭空伪造，也不能在状态
+        前进后重复结算。
+        """
+        slot = self._slot(kind)
+        host = self._pending_host(kind)
+        if host is None or not self._host_active(kind):
+            if token:
+                raise BunkerEngineConflict(f"{slot['host_zh']}状态已变化，请刷新后重试")
+            raise BunkerEngineError(f"当前没有{slot['host_absent_zh']}")
+        pending = host.get(slot["field"])
+        if not pending:
+            if token:
+                raise BunkerEngineConflict(f"该{slot['zh']}已被处理，请刷新后重试")
+            raise BunkerEngineError(f"当前没有待处理的{slot['zh']}")
+        if token is not None and pending.get("token") and token != pending["token"]:
+            raise BunkerEngineConflict(f"该{slot['zh']}决策已过期，请刷新后重试")
+        return host, pending
+
+    def _bound_target(self, pending, choice, pool, member_zh):
+        """单体效果目标校验（在施加任何效果前完成，失败不留部分变更）。
+
+        目标必须与待决快照绑定的目标一致，且在候选池（队内成员）内存活；
+        全体/资源类决策返回 None，效果按整个候选池结算。
+        """
+        if not self._choice_targeted(choice):
+            return None
+        bound_id = pending.get("target_id")
+        if bound_id is None:
+            raise BunkerEngineError(f"该决策需要指定一名{member_zh}作为目标")
+        target = next((r for r in pool if r.id == bound_id), None)
+        if not target or not target.alive:
+            raise BunkerEngineError(f"目标{member_zh}不在队中或已故，无法作为效果目标")
+        return target
+
+    def _apply_stat_effects(self, effects, target, pool, pool_zh, detail_parts):
+        """健康/士气效果：single 只作用于目标本人，all 作用于整个候选池。"""
+        for stat, zh in (("health", "健康"), ("morale", "士气")):
+            if stat not in effects:
+                continue
+            spec = effects[stat]
+            val = self._effect_value(spec)
+            if self._effect_scope(spec) == "single":
+                targets, scope = [target], f"仅{target.name}"
+            else:
+                targets, scope = pool, pool_zh
+            for r in targets:
+                setattr(r, stat, _clamp(getattr(r, stat) + val))
+            detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
+
+    def _sweep_casualties(self, members, casualties):
+        """统一收敛伤亡：健康归零即阵亡。单体/全体效果（以及之前已濒死、
+        被本次效果带过零点的成员）在同一次扫描中处理，保证人口只扣一次、
+        伤亡名单不重不漏。"""
+        for r in members:
+            if r.health <= 0 and r.alive:
+                r.alive = 0
+                r.health = 0
+                if r.id not in casualties:
+                    casualties.append(r.id)
+                    self.session.survivors = max(0, self.session.survivors - 1)
+        return casualties
+
+    # ---- 幂等凭据（并发重放）----
+    # 每类待决事件在档案上各有一列凭据（last_resolution / last_expedition /
+    # last_trade，槽位声明），只保留最近一次结算。宿主随后被清除（返程/交付/
+    # 撤单）或继续在外都不影响：凭据独立保存在档案上，并发落败/连点请求凭
+    # token 命中即安全回放，绝不二次结算。
+    @staticmethod
+    def _credential_matches(rec, require=None, **optional):
+        """通用幂等凭据匹配。
+
+        require 中的键必须逐字相等（强标识：action/event/choice）；
+        optional 中的键只要请求值与凭据值都非空就必须相等——凭据缺字段
+        （旧存档）或请求未携带该凭据（旧客户端无 token）时不误判冲突。
+        """
+        if not rec:
+            return False
+        for key, expected in (require or {}).items():
+            if rec.get(key) != expected:
+                return False
+        for key, expected in optional.items():
+            if expected is None:
+                continue
+            actual = rec.get(key)
+            if actual is not None and actual != expected:
+                return False
+        return True
+
+    @classmethod
+    def _matches_resolution(cls, rec, event_key, choice_key, target_id, day=None):
+        """判断落败/重试请求是否就是上一次已完成的那次危机结算（幂等回放）。
 
         除事件/选项/目标外还核对危机发生日，避免不同天的同类型危机被误重放；
         day 为 None（调用方拿不到上下文）时退化为不校验天数。
         """
-        if not rec or rec.get("event") != event_key or rec.get("choice") != choice_key:
-            return False
-        if day is not None and rec.get("day") is not None and rec.get("day") != day:
+        if not cls._credential_matches(
+            rec, require={"event": event_key, "choice": choice_key}, day=day
+        ):
             return False
         return (rec.get("target_id") or None) == (target_id or None)
+
+    def _read_credential(self, kind):
+        return getattr(self.session, self._slot(kind)["credential_attr"])
+
+    def _write_credential(self, kind, rec):
+        setattr(self.session, self._slot(kind)["credential_attr"], rec)
+
+    def _remember_credential(self, kind, detail, action=None, token=None,
+                             host_token=None, choice=None, day=None, extra=None):
+        """把已完成的抉择/动作写入档案级幂等凭据（每类一列，只留最近一次）。"""
+        rec = {
+            "token": token,
+            "choice": choice,
+            "day": day if day is not None else self.session.day,
+            "detail": detail,
+        }
+        if action is not None:
+            rec["action"] = action
+        host_key = self._slot(kind)["host_token_key"]
+        if host_key:
+            rec[host_key] = host_token
+        if extra:
+            rec.update(extra)
+        self._write_credential(kind, rec)
+
+    def _mission_credential_replay(self, kind, action, token=None,
+                                   host_token=None, choice=None):
+        """命中档案级幂等凭据则返回 (detail, True)，否则返回 (None, False)。"""
+        rec = self._read_credential(kind)
+        optional = {"token": token, "choice": choice}
+        host_key = self._slot(kind)["host_token_key"]
+        if host_key:
+            optional[host_key] = host_token
+        if self._credential_matches(rec, require={"action": action}, **optional):
+            return rec.get("detail", ""), True
+        return None, False
+
+    def _converged_settlement_replay(self, kind, settle_action, token, choice=None):
+        """抉择直接触发宿主收敛（返程/失败回退）时，凭事件 token 回放那次结算。
+
+        事件结算后若宿主当场收敛（补给耗尽/全员失联/弃货/终局），档案级凭据
+        会被收敛记录覆盖，但该记录仍挂着本次事件的一次性 token：并发落败或
+        连点凭 token 命中这里，回放收敛明细，绝不二次结算。
+        """
+        rec = self._read_credential(kind)
+        if not token or not rec or rec.get("action") != settle_action:
+            return None, False
+        if rec.get("token") != token:
+            return None, False
+        if choice is not None and rec.get("choice") is not None and choice != rec["choice"]:
+            return None, False
+        return rec.get("detail", ""), True
 
     def _resolve_target(self, target_id, required):
         """统一解析目标居民。
@@ -558,15 +781,16 @@ class BunkerEngine:
         返回 (detail, replayed)：replayed=True 表示这是重复请求，未再次施加效果。
         """
         self._ensure_running()
-        pending, event = self._pending_event()
+        pending = self._get_pending(PENDING_CRISIS)
+        # 存档损坏（事件池外的事件）时直接判失效，不进入任何结算/回放分支
+        event = self._pending_event_def(PENDING_CRISIS, pending) if pending else None
 
         # 已有同一危机（事件/选项/目标/发生日一致）的结算记录：
         # 重复提交（含并发落败方）只回放，不二次结算
         pending_day = pending.get("day") if pending else None
-        if self._matches_resolution(
-            self.session.last_resolution, event_key, choice_key, target_id, day=pending_day
-        ):
-            return self.session.last_resolution.get("detail", ""), True
+        rec = self._read_credential(PENDING_CRISIS)
+        if self._matches_resolution(rec, event_key, choice_key, target_id, day=pending_day):
+            return rec.get("detail", ""), True
 
         if pending is None:
             raise BunkerEngineError("当前没有待处理的危机，无法结算")
@@ -579,10 +803,7 @@ class BunkerEngine:
         if token is not None and pending.get("token") and token != pending["token"]:
             raise BunkerEngineConflict("该危机决策已过期，请按当前危机重新选择")
 
-        choice = next((c for c in event["choices"] if c["key"] == choice_key), None)
-        if not choice:
-            raise BunkerEngineError("未知决策选项")
-
+        choice = self._event_choice(event, choice_key)
         effects = choice.get("effects", {})
 
         # 作用域由所选决策的效果声明决定，客户端传入的 target_id 不能改变它：
@@ -605,21 +826,8 @@ class BunkerEngine:
             self._add_resource(k, v)
             detail_parts.append(f"{RESOURCE_ZH.get(k,k)} {v:+.0f}")
         # 健康/士气效果：single 只作用于目标本人，all 作用于在堡全体存活者
-        # （探索队外出期间不参与地堡危机结算，与每日短缺/生产口径一致）
-        for stat, zh in (("health", "健康"), ("morale", "士气")):
-            if stat not in effects:
-                continue
-            spec = effects[stat]
-            val = self._effect_value(spec)
-            if self._effect_scope(spec) == "single":
-                pool = [target]
-                scope = f"仅{target.name}"
-            else:
-                pool = self._in_bunker_residents()
-                scope = "全体"
-            for r in pool:
-                setattr(r, stat, _clamp(getattr(r, stat) + val))
-            detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
+        # （探索队/押运队外出期间不参与地堡危机结算，与每日短缺/生产口径一致）
+        self._apply_stat_effects(effects, target, self._in_bunker_residents(), "全体", detail_parts)
         if "add_resident" in effects:
             self._add_resident(effects["add_resident"])
             detail_parts.append(f"加入新幸存者 {effects['add_resident']}")
@@ -644,15 +852,12 @@ class BunkerEngine:
         self._log("crisis", event["title"], f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
 
         # 清除待处理危机并记下幂等凭据——无论后续是否终局，本危机都已结算
-        self.session.pending_crisis = None
-        self.session.last_resolution = {
-            "token": pending.get("token"),
-            "event": event["key"],
-            "choice": choice["key"],
-            "target_id": target.id if targeted else None,
-            "day": pending.get("day"),
-            "detail": detail,
-        }
+        self._write_pending(PENDING_CRISIS, None)
+        self._remember_credential(
+            PENDING_CRISIS, detail,
+            token=pending.get("token"), choice=choice["key"], day=pending.get("day"),
+            extra={"event": event["key"], "target_id": target.id if targeted else None},
+        )
         self._check_end()
         return detail, False
 
@@ -662,7 +867,7 @@ class BunkerEngine:
         返回 (detail, replayed)；请求与任何已知结算都对不上时抛 409，
         由调用方提示“危机状态已变化”，杜绝并发重复结算。
         """
-        rec = self.session.last_resolution
+        rec = self._read_credential(PENDING_CRISIS)
         if self._matches_resolution(rec, event_key, choice_key, target_id) and (
             token is None or not rec.get("token") or token == rec.get("token")
         ):
@@ -700,10 +905,7 @@ class BunkerEngine:
         self._ensure_running()
         if self.phase != PHASE_DAILY:
             raise BunkerEngineError("当前状态无法派遣探索队")
-        if self.session.expedition:
-            raise BunkerEngineError("已有探索队在外，无法同时派遣第二支队伍")
-        if self.session.trade_order:
-            raise BunkerEngineError("已有在谈/在途贸易订单，无法同时派遣探索队")
+        self._require_no_mission("派遣探索队")
         if not member_ids:
             raise BunkerEngineError("必须选择至少一名居民参加探索队")
         if len(set(member_ids)) != len(member_ids):
@@ -792,96 +994,17 @@ class BunkerEngine:
             return None
         event = self.rand.choice(EXPEDITION_ENCOUNTERS)
         encounter = self._build_expedition_encounter(event, exp)
-        exp["pending_encounter"] = encounter
-        # 整体回写，确保 JSON 列变更被追踪并落库
-        self.session.expedition = dict(exp)
+        self._write_pending(PENDING_ENCOUNTER, encounter)
         return encounter
 
     def _build_expedition_encounter(self, event, exp):
+        # 目标只从队内存活队员中抽取（与危机/途中事件同一快照结构）
         alive_members = [r for r in self._away_residents() if r.alive]
-        # 仅当存在单体健康效果的决策时才随机目标队员
-        needs_target = any(
-            self._choice_targeted(c) for c in event["choices"]
-        )
-        target = self.rand.choice(alive_members) if needs_target and alive_members else None
-        return {
-            "token": uuid.uuid4().hex,
-            "event": event["key"],
-            "day": self.session.day,
-            "title": event["title"],
-            "desc": event["desc"],
-            "needs_target": needs_target,
-            "target_id": target.id if target else None,
-            "target_name": target.name if target else None,
-            "choices": [
-                {
-                    "key": c["key"],
-                    "label": c["label"],
-                    "hint": c.get("hint", ""),
-                    "targeted": self._choice_targeted(c),
-                }
-                for c in event["choices"]
-            ],
-        }
+        return self._build_pending_event(event, alive_members)
 
-    # 探索队动作类型（用于档案级幂等凭据 last_expedition）
+    # 探索队动作类型（档案级幂等凭据 last_expedition 的 action 取值）
     _EXP_ACT_ENCOUNTER = "encounter"
     _EXP_ACT_RETURN = "return"
-
-    @staticmethod
-    def _matches_expedition(rec, action, token, exp_token=None, choice_key=None):
-        """判断落败/重试请求是否就是上一次已完成的那次探索队动作（幂等回放）。
-
-        - 遭遇：action=encounter，token=遭遇 token，再核对选项
-        - 返程：action=return，exp_token=队伍 token（返程凭据挂在队伍上）
-        """
-        if not rec or rec.get("action") != action:
-            return False
-        if token is not None and rec.get("token") and token != rec["token"]:
-            return False
-        if action == "return" and exp_token is not None and rec.get("exp_token") and exp_token != rec["exp_token"]:
-            return False
-        if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
-            return False
-        return True
-
-    def _last_expedition_replay(self, action, token, exp_token=None, choice_key=None):
-        """命中档案级幂等记录则返回 (detail, True)，否则返回 (None, False)。"""
-        rec = self.session.last_expedition
-        if self._matches_expedition(rec, action, token, exp_token=exp_token, choice_key=choice_key):
-            return rec.get("detail", ""), True
-        return None, False
-
-    def _encounter_settlement_replay(self, token, choice_key=None):
-        """遭遇请求命中“由该遭遇直接触发的返程结算”凭据时安全回放。
-
-        遭遇结算后若队伍当场收敛（补给耗尽/全员阵亡/终局），档案级凭据会被
-        返程记录覆盖，但该记录仍挂着本次遭遇的一次性 token。并发落败或连点
-        凭 token 命中这里：回放返程结算明细，绝不二次入库战利品。
-        """
-        rec = self.session.last_expedition
-        if not token or not rec or rec.get("action") != self._EXP_ACT_RETURN:
-            return None, False
-        if rec.get("token") != token:
-            return None, False
-        if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
-            return None, False
-        return rec.get("detail", ""), True
-
-    def _remember_expedition(self, action, token, detail, exp_token=None, choice_key=None):
-        """把已完成的探索队动作写入档案级幂等凭据。
-
-        队伍随后可能被清除（返程）或继续在外（遭遇），凭据独立保存在档案上，
-        使并发落败/连点请求在队伍消失后仍能被识别并安全回放。
-        """
-        self.session.last_expedition = {
-            "action": action,
-            "token": token,
-            "exp_token": exp_token,
-            "choice": choice_key,
-            "day": self.session.day,
-            "detail": detail,
-        }
 
     def resolve_expedition_encounter(self, choice_key, token=None):
         """处理探索队途中遭遇：抉择影响队员健康/士气、物资与战利品。
@@ -894,48 +1017,24 @@ class BunkerEngine:
         # 幂等回放优先：遭遇结算后、下一个探索队动作前的连点/并发落败只回放。
         # 若档案级凭据已被后续动作（如返程）覆盖，说明遭遇所属状态已前进，
         # 落到下方的“无在外队伍/无待处理遭遇”分支并按 409 拒绝
-        replay = self._last_expedition_replay(
-            self._EXP_ACT_ENCOUNTER, token, choice_key=choice_key
+        replay = self._mission_credential_replay(
+            PENDING_ENCOUNTER, self._EXP_ACT_ENCOUNTER, token, choice=choice_key
         )
         if replay[0] is not None:
             return replay
         # 遭遇已直接触发队伍收敛（补给耗尽/全员阵亡/终局）：凭据已被返程记录
         # 覆盖，但记录上仍挂着本次遭遇 token，命中则回放返程明细而非 409
-        converged = self._encounter_settlement_replay(token, choice_key=choice_key)
+        converged = self._converged_settlement_replay(
+            PENDING_ENCOUNTER, self._EXP_ACT_RETURN, token, choice=choice_key
+        )
         if converged[0] is not None:
             return converged
-        exp = self.session.expedition
-        if not exp or exp.get("status") != "away":
-            # 携带遭遇凭据却找不到在外队伍：队伍已被其他请求召回，状态已前进
-            if token:
-                raise BunkerEngineConflict("探索队状态已变化，请刷新后重试")
-            raise BunkerEngineError("当前没有在外的探索队")
-        pending = exp.get("pending_encounter")
-        if not pending:
-            # 队伍仍在但该遭遇已被其他请求结算：重复请求安全拒绝并引导刷新
-            if token:
-                raise BunkerEngineConflict("该遭遇已被处理，请刷新后重试")
-            raise BunkerEngineError("当前没有待处理的探索遭遇")
-        if token is not None and pending.get("token") and token != pending["token"]:
-            raise BunkerEngineConflict("该遭遇决策已过期，请刷新后重试")
-        event_key = pending.get("event")
-        event = next((e for e in EXPEDITION_ENCOUNTERS if e["key"] == event_key), None)
-        if not event:
-            raise BunkerEngineError("探索遭遇已失效，请刷新档案后重试")
-        choice = next((c for c in event["choices"] if c["key"] == choice_key), None)
-        if not choice:
-            raise BunkerEngineError("未知决策选项")
+        exp, pending = self._locate_pending_decision(PENDING_ENCOUNTER, token)
+        event = self._pending_event_def(PENDING_ENCOUNTER, pending)
+        choice = self._event_choice(event, choice_key)
         effects = choice.get("effects", {})
         # 单体目标校验：必须是队内存活队员，且与待处理遭遇绑定
-        targeted = self._choice_targeted(choice)
-        target = None
-        if targeted:
-            bound_id = pending.get("target_id")
-            if bound_id is None:
-                raise BunkerEngineError("该决策需要指定一名队员作为目标")
-            target = next((r for r in self._away_residents() if r.id == bound_id), None)
-            if not target or not target.alive:
-                raise BunkerEngineError("目标队员不在队中或已故，无法作为效果目标")
+        target = self._bound_target(pending, choice, self._away_residents(), "队员")
         # 在应用任何效果前完成校验，保证失败时档案状态不发生部分变更
         detail_parts = []
         exp.setdefault("casualties", [])
@@ -953,32 +1052,9 @@ class BunkerEngine:
             detail_parts.append(f"物资损失 {RESOURCE_ZH.get(k, k)} -{v:g}")
         exp["supplies"] = supplies
         # 健康/士气：单体作用于目标队员，全体作用于队内存活者
-        for stat, zh in (("health", "健康"), ("morale", "士气")):
-            if stat not in effects:
-                continue
-            spec = effects[stat]
-            val = self._effect_value(spec)
-            if self._effect_scope(spec) == "single":
-                pool = [target]
-                scope = f"仅{target.name}"
-            else:
-                pool = alive_members
-                scope = "全体队员"
-            for r in pool:
-                setattr(r, stat, _clamp(getattr(r, stat) + val))
-            detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
-        # 全部效果施加完毕后统一收敛伤亡：健康归零即阵亡。单体/全体效果
-        # （以及遭遇前已濒死、被本次效果带过零点的队员）在同一次扫描中处理，
-        # 保证人口只扣一次、casualties 不重不漏
-        casualties = exp.get("casualties", [])
-        for r in alive_members:
-            if r.health <= 0 and r.alive:
-                r.alive = 0
-                r.health = 0
-                if r.id not in casualties:
-                    casualties.append(r.id)
-                    self.session.survivors = max(0, self.session.survivors - 1)
-        exp["casualties"] = casualties
+        self._apply_stat_effects(effects, target, alive_members, "全体队员", detail_parts)
+        # 全部效果施加完毕后统一收敛伤亡：健康归零即阵亡
+        exp["casualties"] = self._sweep_casualties(alive_members, exp.get("casualties", []))
         # 健康结算：受伤队员登记为病例，随队伍冻结，回堡后续治
         if "health" in effects:
             spec = effects["health"]
@@ -1004,7 +1080,7 @@ class BunkerEngine:
             self.session.survivors += 1
             detail_parts.append(f"新幸存者 {name} 加入队伍")
         # 日志与实际结算同一作用域
-        scope_zh = f"（目标：{target.name}）" if targeted else ""
+        scope_zh = f"（目标：{target.name}）" if target else ""
         detail = "，".join(detail_parts) if detail_parts else "无显著变化"
         self._log("crisis", f"探索遭遇·{event['title']}", f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
         # 清除待处理遭遇、写入档案级幂等凭据，队伍继续在外行军
@@ -1012,9 +1088,9 @@ class BunkerEngine:
         exp["pending_encounter"] = None
         exp["encounters_resolved"] = exp.get("encounters_resolved", 0) + 1
         self.session.expedition = dict(exp)
-        self._remember_expedition(
-            self._EXP_ACT_ENCOUNTER, enc_token, detail,
-            exp_token=exp.get("token"), choice_key=choice["key"],
+        self._remember_credential(
+            PENDING_ENCOUNTER, detail, action=self._EXP_ACT_ENCOUNTER,
+            token=enc_token, host_token=exp.get("token"), choice=choice["key"],
         )
         # 遭遇结算后立即收敛，不把“零补给 / 全员阵亡 / 人口归零”的队伍留给下一步：
         #   1) 全员阵亡 —— 无人生还的队伍不能继续行军（僵尸队伍）
@@ -1039,7 +1115,9 @@ class BunkerEngine:
             # 遭遇响应同时承载遭遇效果与当场返程结算；返程凭据记录同一份
             # 明细，保证该遭遇的连点/并发落败回放结果逐字一致
             detail = f"{detail}；队伍返程：{return_detail}"
-            self.session.last_expedition["detail"] = detail
+            rec = self._read_credential(PENDING_ENCOUNTER)
+            rec["detail"] = detail
+            self._write_credential(PENDING_ENCOUNTER, rec)
             return detail, False
         return detail, False
 
@@ -1048,20 +1126,26 @@ class BunkerEngine:
 
         对不上任何已知结算时抛 409，由调用方提示刷新，杜绝并发重复结算。
         """
-        rec = self.session.last_expedition
         if action == self._EXP_ACT_ENCOUNTER:
-            ok = self._matches_expedition(rec, action, token, choice_key=choice_key)
-            if not ok:
-                # 遭遇已直接触发队伍收敛（返程凭据覆盖了遭遇凭据）：
-                # 凭遭遇 token 回放那次返程结算，落败方同样拿到 200 而非 409；
-                # 对不上任何已知结算（token/选项不符）则落入统一的 409
-                settled = self._encounter_settlement_replay(token, choice_key=choice_key)
-                if settled[0] is not None:
-                    return settled
+            replay = self._mission_credential_replay(
+                PENDING_ENCOUNTER, action, token, choice=choice_key
+            )
+            if replay[0] is not None:
+                return replay
+            # 遭遇已直接触发队伍收敛（返程凭据覆盖了遭遇凭据）：
+            # 凭遭遇 token 回放那次返程结算，落败方同样拿到 200 而非 409；
+            # 对不上任何已知结算（token/选项不符）则落入统一的 409
+            converged = self._converged_settlement_replay(
+                PENDING_ENCOUNTER, self._EXP_ACT_RETURN, token, choice=choice_key
+            )
+            if converged[0] is not None:
+                return converged
         else:
-            ok = self._matches_expedition(rec, action, token, exp_token=exp_token)
-        if ok:
-            return rec.get("detail", ""), True
+            replay = self._mission_credential_replay(
+                PENDING_ENCOUNTER, action, token, host_token=exp_token
+            )
+            if replay[0] is not None:
+                return replay
         raise BunkerEngineConflict("探索队状态已被其他请求更新，请刷新后重试")
 
     def return_expedition(self, token=None):
@@ -1073,8 +1157,8 @@ class BunkerEngine:
         """
         self._ensure_running()
         # 幂等回放优先：返程后队伍已清除，凭据仍在档案上可识别连点/并发落败请求
-        replay = self._last_expedition_replay(
-            self._EXP_ACT_RETURN, None, exp_token=token
+        replay = self._mission_credential_replay(
+            PENDING_ENCOUNTER, self._EXP_ACT_RETURN, host_token=token
         )
         if replay[0] is not None:
             return replay
@@ -1084,7 +1168,7 @@ class BunkerEngine:
         if not exp or exp.get("status") != "away":
             # 队伍已不在外：通常是上一次返程已完成。携带不匹配 token 的请求
             # 属于过期/串档，明确报 409；完全无凭据时才按“无队伍”处理
-            rec = self.session.last_expedition
+            rec = self._read_credential(PENDING_ENCOUNTER)
             if token and rec and rec.get("action") == self._EXP_ACT_RETURN:
                 raise BunkerEngineConflict("探索队状态已过期，请刷新后重试")
             raise BunkerEngineError("当前没有在外的探索队")
@@ -1105,9 +1189,11 @@ class BunkerEngine:
         优先于本方法内部快照。返回 (detail, replayed)。
         """
         exp_token = exp.get("token")
-        rec = self.session.last_expedition
-        if rec and rec.get("action") == self._EXP_ACT_RETURN and rec.get("exp_token") == exp_token:
-            return rec.get("detail", ""), True
+        replay = self._mission_credential_replay(
+            PENDING_ENCOUNTER, self._EXP_ACT_RETURN, host_token=exp_token
+        )
+        if replay[0] is not None:
+            return replay
         members = self._away_residents()
         dead_members = [r for r in members if not r.alive]
         # 终局裁决在战利品/余粮入库前快照：全线枯竭的败局不得被随后入库的
@@ -1142,9 +1228,9 @@ class BunkerEngine:
         detail = "；".join(detail_parts)
         self._log("system", f"探索队返程（{reason}）", detail, decision="返程结算")
         # 先写档案级幂等凭据，再清除探索队状态：凭据在队伍消失后依然可查
-        self._remember_expedition(
-            self._EXP_ACT_RETURN, enc_token, detail,
-            exp_token=exp_token, choice_key=enc_choice,
+        self._remember_credential(
+            PENDING_ENCOUNTER, detail, action=self._EXP_ACT_RETURN,
+            token=enc_token, host_token=exp_token, choice=enc_choice,
         )
         self.session.expedition = None
         # 用入库前快照收敛终局；无预设败局时再按结算后状态正常判定
@@ -1230,10 +1316,7 @@ class BunkerEngine:
     def apply_trade(self, offer_id, escort_ids):
         """提交贸易/救援订单申请：冻结托管物资、组建押运队，进入 reviewing。"""
         self._require_daily_phase("申请贸易订单")
-        if self.session.expedition:
-            raise BunkerEngineError("探索队在外期间无法办理贸易订单")
-        if self.session.trade_order:
-            raise BunkerEngineError("已有在谈/在途贸易订单，无法同时申请第二笔")
+        self._require_no_mission("办理贸易订单")
         offer = self._find_offer(offer_id)
         if offer is None:
             raise BunkerEngineError("报价已过期或不存在（市场每日轮换），请重新打开市场")
@@ -1288,13 +1371,13 @@ class BunkerEngine:
         """审核阶段主动撤单：全额退还托管。进入运输后不可撤单。"""
         self._ensure_running()
         # 幂等回放优先：撤单后订单已清除，凭据仍在档案上可识别连点
-        replay = self._last_trade_replay(self._TRADE_ACT_CANCEL, token)
+        replay = self._mission_credential_replay(PENDING_INCIDENT, self._TRADE_ACT_CANCEL, token)
         if replay[0] is not None:
             return replay
         self._require_daily_phase("撤销贸易订单")
         order = self.session.trade_order
         if not order:
-            if token and self.session.last_trade:
+            if token and self._read_credential(PENDING_INCIDENT):
                 raise BunkerEngineConflict("贸易订单状态已变化，请刷新后重试")
             raise BunkerEngineError("当前没有在谈的贸易订单")
         if token is not None and order.get("token") and token != order["token"]:
@@ -1305,7 +1388,7 @@ class BunkerEngine:
         detail = self._refund_escrow(order, ratio=1.0, label="撤单退还")
         self._log("trade", f"撤单·{order['partner_name']}", detail, decision="撤销申请")
         detail = detail or "托管物资已全额退还"
-        self._remember_trade(self._TRADE_ACT_CANCEL, order.get("token"), detail)
+        self._remember_credential(PENDING_INCIDENT, detail, action=self._TRADE_ACT_CANCEL, token=order.get("token"))
         self.session.trade_order = None
         return detail, False
 
@@ -1332,9 +1415,9 @@ class BunkerEngine:
             if pre_verdict is not None:
                 detail = self._refund_escrow(order, ratio=1.0, label="终局撤单退还")
                 self._log("trade", f"撤单·{order['partner_name']}", detail or "终局已至，申请撤销", decision="终局撤单")
-                self._remember_trade(
-                    self._TRADE_ACT_CANCEL, order.get("token"),
-                    detail or "终局已至，申请撤销",
+                self._remember_credential(
+                    PENDING_INCIDENT, detail or "终局已至，申请撤销",
+                    action=self._TRADE_ACT_CANCEL, token=order.get("token"),
                 )
                 self.session.trade_order = None
                 return None
@@ -1383,8 +1466,7 @@ class BunkerEngine:
         if self.rand.random() <= TRADE_INCIDENT_CHANCE:
             event = self.rand.choice(TRADE_INCIDENTS)
             incident = self._build_trade_incident(event, order)
-            order["pending_incident"] = incident
-            self.session.trade_order = dict(order)
+            self._write_pending(PENDING_INCIDENT, incident)
             return incident
         self.session.trade_order = dict(order)
         return None
@@ -1392,73 +1474,12 @@ class BunkerEngine:
     def _build_trade_incident(self, event, order):
         """构造途中事件快照（与危机/探索遭遇同一结构，刷新后可恢复抉择）。"""
         alive_escorts = [r for r in self._trade_escorts(order) if r.alive]
-        needs_target = any(self._choice_targeted(c) for c in event["choices"])
-        target = self.rand.choice(alive_escorts) if needs_target and alive_escorts else None
-        return {
-            "token": uuid.uuid4().hex,
-            "event": event["key"],
-            "day": self.session.day,
-            "title": event["title"],
-            "desc": event["desc"],
-            "needs_target": needs_target,
-            "target_id": target.id if target else None,
-            "target_name": target.name if target else None,
-            "choices": [
-                {
-                    "key": c["key"],
-                    "label": c["label"],
-                    "hint": c.get("hint", ""),
-                    "targeted": self._choice_targeted(c),
-                }
-                for c in event["choices"]
-            ],
-        }
+        return self._build_pending_event(event, alive_escorts)
 
-    # 贸易动作类型（档案级幂等凭据 last_trade）
+    # 贸易动作类型（档案级幂等凭据 last_trade 的 action 取值）
     _TRADE_ACT_INCIDENT = "incident"
     _TRADE_ACT_SETTLE = "settle"   # 订单收敛（交付成功 / 失败回退 / 撤单退款）
     _TRADE_ACT_CANCEL = "cancel"
-
-    @staticmethod
-    def _matches_trade(rec, action, token, order_token=None, choice_key=None):
-        """判断落败/重试请求是否就是上一次已完成的贸易动作（幂等回放）。"""
-        if not rec or rec.get("action") != action:
-            return False
-        if token is not None and rec.get("token") and token != rec["token"]:
-            return False
-        if order_token is not None and rec.get("order_token") and order_token != rec["order_token"]:
-            return False
-        if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
-            return False
-        return True
-
-    def _last_trade_replay(self, action, token, order_token=None, choice_key=None):
-        rec = self.session.last_trade
-        if self._matches_trade(rec, action, token, order_token=order_token, choice_key=choice_key):
-            return rec.get("detail", ""), True
-        return None, False
-
-    def _incident_failure_replay(self, token, choice_key=None):
-        """途中事件抉择直接触发订单收敛（弃货/全损/全员失联）时，凭事件 token
-        回放那次结算明细。"""
-        rec = self.session.last_trade
-        if not token or not rec or rec.get("action") != self._TRADE_ACT_SETTLE:
-            return None, False
-        if rec.get("token") != token:
-            return None, False
-        if choice_key is not None and rec.get("choice") is not None and choice_key != rec["choice"]:
-            return None, False
-        return rec.get("detail", ""), True
-
-    def _remember_trade(self, action, token, detail, order_token=None, choice_key=None):
-        self.session.last_trade = {
-            "action": action,
-            "token": token,
-            "order_token": order_token,
-            "choice": choice_key,
-            "day": self.session.day,
-            "detail": detail,
-        }
 
     def resolve_trade_incident(self, choice_key, token=None):
         """结算押运途中的事件抉择。
@@ -1469,41 +1490,22 @@ class BunkerEngine:
         返回 (detail, replayed)。
         """
         self._ensure_running()
-        replay = self._last_trade_replay(self._TRADE_ACT_INCIDENT, token, choice_key=choice_key)
+        replay = self._mission_credential_replay(
+            PENDING_INCIDENT, self._TRADE_ACT_INCIDENT, token, choice=choice_key
+        )
         if replay[0] is not None:
             return replay
         # 事件抉择直接触发失败收敛：凭据已被失败记录覆盖，但仍挂着事件 token
-        converged = self._incident_failure_replay(token, choice_key=choice_key)
+        converged = self._converged_settlement_replay(
+            PENDING_INCIDENT, self._TRADE_ACT_SETTLE, token, choice=choice_key
+        )
         if converged[0] is not None:
             return converged
-        order = self.session.trade_order
-        if not order or order.get("status") != TRADE_TRANSPORTING:
-            if token:
-                raise BunkerEngineConflict("贸易订单状态已变化，请刷新后重试")
-            raise BunkerEngineError("当前没有在途的贸易订单")
-        pending = order.get("pending_incident")
-        if not pending:
-            if token:
-                raise BunkerEngineConflict("该途中事件已被处理，请刷新后重试")
-            raise BunkerEngineError("当前没有待处理的途中事件")
-        if token is not None and pending.get("token") and token != pending["token"]:
-            raise BunkerEngineConflict("该途中事件决策已过期，请按当前事件重新选择")
-        event = next((e for e in TRADE_INCIDENTS if e["key"] == pending.get("event")), None)
-        if not event:
-            raise BunkerEngineError("途中事件已失效，请刷新档案后重试")
-        choice = next((c for c in event["choices"] if c["key"] == choice_key), None)
-        if not choice:
-            raise BunkerEngineError("未知决策选项")
+        order, pending = self._locate_pending_decision(PENDING_INCIDENT, token)
+        event = self._pending_event_def(PENDING_INCIDENT, pending)
+        choice = self._event_choice(event, choice_key)
         effects = choice.get("effects", {})
-        targeted = self._choice_targeted(choice)
-        target = None
-        if targeted:
-            bound_id = pending.get("target_id")
-            if bound_id is None:
-                raise BunkerEngineError("该决策需要指定一名押运队员作为目标")
-            target = next((r for r in self._trade_escorts(order) if r.id == bound_id), None)
-            if not target or not target.alive:
-                raise BunkerEngineError("目标队员不在押运队中或已故，无法作为效果目标")
+        target = self._bound_target(pending, choice, self._trade_escorts(order), "押运队员")
         # 校验全部完成后再施加效果，失败不留部分变更
         detail_parts = []
         alive_escorts = [r for r in self._trade_escorts(order) if r.alive]
@@ -1518,29 +1520,13 @@ class BunkerEngine:
         if effects.get("reputation"):
             rep = self._add_reputation(int(effects["reputation"]))
             detail_parts.append(f"信誉 {int(effects['reputation']):+d}（现 {rep}）")
-        for stat, zh in (("health", "健康"), ("morale", "士气")):
-            if stat not in effects:
-                continue
-            spec = effects[stat]
-            val = self._effect_value(spec)
-            if self._effect_scope(spec) == "single":
-                pool, scope = [target], f"仅{target.name}"
-            else:
-                pool, scope = alive_escorts, "全体押运队员"
-            for r in pool:
-                setattr(r, stat, _clamp(getattr(r, stat) + val))
-            detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
+        self._apply_stat_effects(effects, target, alive_escorts, "全体押运队员", detail_parts)
         if effects.get("abort"):
             detail_parts.append("弃货撤回")
         # 统一收敛押运伤亡（与探索遭遇同一口径，人口只扣一次）
-        casualties = order.setdefault("casualties", [])
-        for r in alive_escorts:
-            if r.health <= 0 and r.alive:
-                r.alive = 0
-                r.health = 0
-                if r.id not in casualties:
-                    casualties.append(r.id)
-                    self.session.survivors = max(0, self.session.survivors - 1)
+        order["casualties"] = self._sweep_casualties(
+            alive_escorts, order.get("casualties", [])
+        )
         # 健康结算：受伤押运队员登记为病例，随押运队冻结，归队后续治
         if "health" in effects:
             spec = effects["health"]
@@ -1551,16 +1537,16 @@ class BunkerEngine:
                 affected, infectious_event=event["key"] in MED_INFECTIOUS_INCIDENT_EVENTS,
                 reason=f"途中事件·{event['title']}", force=True,
             )
-        scope_zh = f"（目标：{target.name}）" if targeted else ""
+        scope_zh = f"（目标：{target.name}）" if target else ""
         detail = "，".join(detail_parts) if detail_parts else "无显著变化"
         self._log("crisis", f"途中事件·{event['title']}", f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
         inc_token = pending.get("token")
         order["pending_incident"] = None
         order["incidents_resolved"] += 1
         self.session.trade_order = dict(order)
-        self._remember_trade(
-            self._TRADE_ACT_INCIDENT, inc_token, detail,
-            order_token=order.get("token"), choice_key=choice["key"],
+        self._remember_credential(
+            PENDING_INCIDENT, detail, action=self._TRADE_ACT_INCIDENT,
+            token=inc_token, host_token=order.get("token"), choice=choice["key"],
         )
         # 与探索遭遇一致：事件结算后立即收敛，不把零货物/全员阵亡的队伍留给下一步
         alive_after = [r for r in self._trade_escorts(order) if r.alive]
@@ -1576,7 +1562,8 @@ class BunkerEngine:
             self._deliver_trade_order(
                 self.session.trade_order, reason="终局已至，押运队返程", force_success=True,
             )
-            return_detail = self.session.last_trade.get("detail", "") if self.session.last_trade else ""
+            rec = self._read_credential(PENDING_INCIDENT)
+            return_detail = rec.get("detail", "") if rec else ""
             detail = f"{detail}；订单结算：{return_detail}" if return_detail else detail
             return detail, False
         if settle_reason is not None:
@@ -1585,25 +1572,31 @@ class BunkerEngine:
                 inc_token=inc_token, inc_choice=choice["key"],
             )
             detail = f"{detail}；订单回退：{return_detail}"
-            self.session.last_trade["detail"] = detail
+            rec = self._read_credential(PENDING_INCIDENT)
+            rec["detail"] = detail
+            self._write_credential(PENDING_INCIDENT, rec)
             return detail, False
         return detail, False
 
     def reconcile_stale_trade(self, action, token=None, choice_key=None):
         """并发落败后核对贸易动作：同一次抉择/结算则安全回放，否则 409。"""
-        rec = self.session.last_trade
         if action == self._TRADE_ACT_INCIDENT:
-            ok = self._matches_trade(rec, action, token, choice_key=choice_key)
-            if not ok:
-                # 事件抉择直接触发订单收敛（结算凭据覆盖了事件凭据）：
-                # 凭事件 token 回放那次结算，落败方同样拿到 200 而非 409
-                settled = self._incident_failure_replay(token, choice_key=choice_key)
-                if settled[0] is not None:
-                    return settled
+            replay = self._mission_credential_replay(
+                PENDING_INCIDENT, action, token, choice=choice_key
+            )
+            if replay[0] is not None:
+                return replay
+            # 事件抉择直接触发订单收敛（结算凭据覆盖了事件凭据）：
+            # 凭事件 token 回放那次结算，落败方同样拿到 200 而非 409
+            converged = self._converged_settlement_replay(
+                PENDING_INCIDENT, self._TRADE_ACT_SETTLE, token, choice=choice_key
+            )
+            if converged[0] is not None:
+                return converged
         else:
-            ok = self._matches_trade(rec, action, token)
-        if ok:
-            return rec.get("detail", ""), True
+            replay = self._mission_credential_replay(PENDING_INCIDENT, action, token)
+            if replay[0] is not None:
+                return replay
         raise BunkerEngineConflict("贸易订单状态已被其他请求更新，请刷新后重试")
 
     def _trade_rep_penalty(self, order):
@@ -1672,7 +1665,10 @@ class BunkerEngine:
             title = f"采购到货·{order['partner_name']}"
         detail = "；".join(parts)
         self._log("trade", title, f"{reason}。{detail}", decision="交付结算")
-        self._remember_trade(self._TRADE_ACT_SETTLE, None, detail, order_token=order.get("token"))
+        self._remember_credential(
+            PENDING_INCIDENT, detail, action=self._TRADE_ACT_SETTLE,
+            host_token=order.get("token"),
+        )
         # 用交付前快照收敛终局
         self.session.trade_order = None
         self._check_end(forced_verdict=verdict)
@@ -1706,9 +1702,9 @@ class BunkerEngine:
             parts.append(f"殉职：{'、'.join(dead)}")
         detail = "；".join(parts)
         self._log("trade", f"订单失败·{order['partner_name']}", f"{reason}。{detail}", decision="失败回退")
-        self._remember_trade(
-            self._TRADE_ACT_SETTLE, inc_token, detail,
-            order_token=order.get("token"), choice_key=inc_choice,
+        self._remember_credential(
+            PENDING_INCIDENT, detail, action=self._TRADE_ACT_SETTLE,
+            token=inc_token, host_token=order.get("token"), choice=inc_choice,
         )
         self.session.trade_order = None
         self._check_end(forced_verdict=verdict)
@@ -2179,9 +2175,7 @@ class BunkerEngine:
             return
         self.session.status = "win" if win else "over"
         # 进入终局后不存在悬而未决的抉择/在外队伍/在途订单，状态机统一收敛到 ended
-        self.session.pending_crisis = None
-        self.session.expedition = None
-        self.session.trade_order = None
+        self._clear_all_pending()
         alive = [r for r in self.session.residents if r.alive]
         # 计分：幸存者 * 天数 * 士气系数
         morale = self.avg_morale()
@@ -2659,3 +2653,55 @@ TRADE_INCIDENTS = [
         ],
     },
 ]
+
+
+# ============ 待决事件槽位注册表 ============
+# 三类挂起抉择（地堡危机/探索遭遇/押运途中事件）的统一声明：引擎的
+# "待决事件统一管线"（快照构造/落库恢复/幂等凭据/互斥状态机/终局收敛）
+# 全部按本表驱动，新增一类待决事件只需在此登记一个槽位。
+#
+#   host_attr / host_status  宿主快照列与可挂起状态（None 表示宿主即档案本身）
+#   field                    待决快照所在字段（档案列或宿主快照内的键）
+#   pool                     事件池（结算时按快照 event 键回查定义）
+#   credential_attr          档案级幂等凭据列（并发落败/连点安全回放）
+#   phase                    挂起时状态机进入的阶段（互斥：锁定经营与推进）
+#   host_token_key           幂等凭据中宿主 token 的键名（危机宿主即档案，无）
+#   zh / host_zh / host_absent_zh  统一报错文案用词
+_PENDING_SLOTS = {
+    PENDING_CRISIS: {
+        "host_attr": None,
+        "host_status": None,
+        "field": "pending_crisis",
+        "pool": CRISIS_POOL,
+        "credential_attr": "last_resolution",
+        "phase": PHASE_CRISIS,
+        "host_token_key": None,
+        "zh": "危机",
+        "host_zh": "档案",
+        "host_absent_zh": "待处理的危机",
+    },
+    PENDING_ENCOUNTER: {
+        "host_attr": "expedition",
+        "host_status": "away",
+        "field": "pending_encounter",
+        "pool": EXPEDITION_ENCOUNTERS,
+        "credential_attr": "last_expedition",
+        "phase": PHASE_EXPEDITION,
+        "host_token_key": "exp_token",
+        "zh": "探索遭遇",
+        "host_zh": "探索队",
+        "host_absent_zh": "在外的探索队",
+    },
+    PENDING_INCIDENT: {
+        "host_attr": "trade_order",
+        "host_status": TRADE_TRANSPORTING,
+        "field": "pending_incident",
+        "pool": TRADE_INCIDENTS,
+        "credential_attr": "last_trade",
+        "phase": PHASE_TRADE,
+        "host_token_key": "order_token",
+        "zh": "途中事件",
+        "host_zh": "贸易订单",
+        "host_absent_zh": "在途的贸易订单",
+    },
+}
