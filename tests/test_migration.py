@@ -432,3 +432,202 @@ def test_valid_medical_cases_left_untouched(db):
     db.expire_all()
     kept = db.get(GameSession, sid).medical_cases
     assert {c["id"] for c in kept} == {"c1", "c2"}
+
+
+# ---- 已下线事件 key 的待处理快照（防软锁） ----
+
+def _write_expedition(sid, exp):
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE game_sessions SET expedition = :e WHERE id = :sid"),
+            {"e": json.dumps(exp, ensure_ascii=False), "sid": sid},
+        )
+
+
+def test_unknown_crisis_event_key_cleared(db):
+    """待处理危机引用已下线事件 key：清空，档案回到可推进的每日阶段。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    db.execute(
+        text("UPDATE game_sessions SET pending_crisis = :c WHERE id = :sid"),
+        {"c": json.dumps({
+            "token": "t", "event": "removed_event",
+            "choices": [{"key": "x"}], "target_id": None,
+        }), "sid": sid},
+    )
+    db.commit()
+
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.pending_crisis is None
+    eng = BunkerEngine(db, fixed, rand=FixedRand())
+    assert eng.phase == "daily"
+    eng.advance_day()  # 不再被已失效的危机软锁
+    db.commit()
+
+
+def test_unknown_encounter_event_key_dropped_team_kept(db):
+    """探索遭遇引用已下线事件 key：仅丢弃遭遇，队伍保留并可继续行军。"""
+    gs = make_session(db)
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    db.execute(
+        text("UPDATE game_sessions SET expedition = :e WHERE id = :sid"),
+        {"e": json.dumps({
+            "status": "away", "token": "team", "members": [valid],
+            "supplies": {"food": 5, "water": 5}, "travel_days": 1,
+            "pending_encounter": {
+                "token": "enc", "event": "removed_encounter",
+                "choices": [{"key": "a"}], "target_id": None,
+            },
+        }), "sid": sid},
+    )
+    db.commit()
+
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.expedition is not None
+    assert fixed.expedition["pending_encounter"] is None
+    eng = BunkerEngine(db, fixed, rand=FixedRand())
+    assert eng.phase == "daily"
+    eng.advance_day()  # 队伍继续行军，不再软锁
+    db.commit()
+
+
+def test_unknown_incident_event_key_dropped_order_kept(db):
+    """途中事件引用已下线事件 key：仅丢弃事件，订单保留并可继续运输。"""
+    gs = make_session(db)
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    _write_trade(sid, {
+        "status": "transporting", "token": "o1", "type": "rescue",
+        "escorts": [valid], "eta": 3, "travel_days": 1,
+        "escrow": {"food": 20}, "cargo": {"water": 30}, "cargo_ratio": 1.0,
+        "pending_incident": {
+            "token": "inc", "event": "removed_incident",
+            "choices": [{"key": "a"}], "target_id": None,
+        },
+    })
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.trade_order is not None
+    assert fixed.trade_order["pending_incident"] is None
+    eng = BunkerEngine(db, fixed, rand=FixedRand())
+    assert eng.phase == "daily"
+    eng.advance_day()  # 订单继续推进，不再软锁
+    db.commit()
+
+
+def test_known_event_keys_left_untouched(db):
+    """事件 key 仍在当前池中的待处理快照：归一化零改写。"""
+    gs = make_session(db)
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    db.execute(
+        text("UPDATE game_sessions SET pending_crisis = :c, expedition = :e WHERE id = :sid"),
+        {
+            "c": json.dumps({
+                "token": "t", "event": "mutiny",
+                "choices": [{"key": "suppress"}], "target_id": None,
+            }),
+            "e": json.dumps({
+                "status": "away", "token": "team", "members": [valid],
+                "supplies": {"food": 5, "water": 5}, "travel_days": 1,
+                "pending_encounter": {
+                    "token": "enc", "event": "cache",
+                    "choices": [{"key": "search_carefully"}], "target_id": None,
+                },
+            }),
+            "sid": sid,
+        },
+    )
+    db.commit()
+    # 危机与探索队并存：危机待处理属合法状态（顺序结算），不属互斥违规
+    assert reconcile_old_saves(engine) == 0
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.pending_crisis["event"] == "mutiny"
+    assert fixed.expedition["pending_encounter"]["event"] == "cache"
+
+
+# ---- 探索队 / 贸易订单并存的互斥收敛 ----
+
+def test_coexisting_expedition_and_reviewing_order_converges(db):
+    """探索队与审核中订单并存：保留探索队，订单撤单收敛，托管全额退回资源。"""
+    gs = make_session(db, resources={FOOD: 100, WATER: 100, POWER: 100, OXY: 100})
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    _write_expedition(sid, {
+        "status": "away", "token": "team", "members": [valid],
+        "supplies": {"food": 5, "water": 5}, "travel_days": 1,
+        "pending_encounter": None,
+    })
+    _write_trade(sid, {
+        "status": "reviewing", "token": "o1", "type": "procure",
+        "escorts": [gs.residents[1].id], "eta": 2,
+        "escrow": {"food": 20, "power": 10}, "cargo": {"water": 30},
+        "cargo_ratio": 1.0, "travel_days": 0, "pending_incident": None,
+    })
+
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.expedition is not None        # 探索队保留
+    assert fixed.trade_order is None           # 订单收敛
+    assert fixed.resources[FOOD] == 120        # 托管全额退回
+    assert fixed.resources[POWER] == 110
+    # 幂等：第二次归一化零更新
+    assert reconcile_old_saves(engine) == 0
+
+
+def test_coexisting_transporting_order_refunded_at_ratio(db):
+    """探索队与在途订单并存：订单按失败回退口径收敛，托管按残存比例退回。"""
+    gs = make_session(db, resources={FOOD: 100, WATER: 100, POWER: 100, OXY: 100})
+    valid = gs.residents[0].id
+    db.commit()
+    sid = gs.id
+    _write_expedition(sid, {
+        "status": "away", "token": "team", "members": [valid],
+        "supplies": {"food": 5, "water": 5}, "travel_days": 1,
+    })
+    _write_trade(sid, {
+        "status": "transporting", "token": "o1", "type": "rescue",
+        "escorts": [gs.residents[1].id], "eta": 3, "travel_days": 1,
+        "escrow": {"food": 40}, "cargo": {"water": 50}, "cargo_ratio": 0.5,
+        "pending_incident": None,
+    })
+
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.expedition is not None
+    assert fixed.trade_order is None
+    assert fixed.resources[FOOD] == 120        # 40 * 0.5 残存退回
+    assert reconcile_old_saves(engine) == 0
+
+
+def test_coexisting_both_dangling_cleared_independently(db):
+    """并存的两者各自损坏（成员全悬空）：各自清空，不涉及托管退款。"""
+    gs = make_session(db, resources={FOOD: 100, WATER: 100, POWER: 100, OXY: 100})
+    db.commit()
+    sid = gs.id
+    _write_expedition(sid, {"status": "away", "members": [424242], "token": "t"})
+    _write_trade(sid, {
+        "status": "transporting", "token": "o1", "escorts": [525252],
+        "eta": 3, "travel_days": 1, "escrow": {"food": 40},
+    })
+
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    fixed = db.get(GameSession, sid)
+    assert fixed.expedition is None
+    assert fixed.trade_order is None
+    assert fixed.resources[FOOD] == 100        # 订单因悬空清除，不触发互斥退款
